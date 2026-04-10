@@ -1,0 +1,11 @@
+data/*.pdf
+data/*.md
+data/**/*.pdf
+data/**/*.md
+data/uploads/*
+!data/uploads/.gitkeep
+
+# Optional local artifacts
+__pycache__/
+*.pyc
+.venv/
