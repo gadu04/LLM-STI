@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 import streamlit as st
 
 from output_writer import write_markdown_output
@@ -54,7 +55,14 @@ def _render_products_table(products_box, products: list[dict[str, Any]]) -> None
                 "Ghi chú": item.get("ghi_chu") or "",
             }
         )
-    products_box.dataframe(rows, use_container_width=True)
+    df = pd.DataFrame(rows)
+    styled = df.style.set_properties(
+        **{
+            "white-space": "normal",
+            "text-align": "left",
+        }
+    )
+    products_box.dataframe(styled, use_container_width=True, hide_index=True)
 
 
 st.set_page_config(page_title="Trích xuất tài liệu STI", page_icon="📄", layout="wide")

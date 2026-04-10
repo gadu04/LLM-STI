@@ -1,6 +1,6 @@
 # Kết quả bóc tách thông tin báo cáo
 
-- Thời gian tạo: 2026-04-11 01:16:19
+- Thời gian tạo: 2026-04-11 01:21:41
 - Tên nhiệm vụ: NGHIÊN CỨU, XÂY DỰNG QUY TRÌNH XỬ LÝ NƯỚC THẢI NHIỄM XĂNG DẦU ỨNG DỤNG VI SINH VẬT BẢN ĐỊA
 - Chủ nhiệm: ThS. Đinh Thị Vân
 - Tổ chức chủ trì: Trung tâm Nhiệt đới Việt Nga, Chi nhánh phía Nam
@@ -30,11 +30,11 @@
 - Kết quả chính: Quy trình xử lý nước thải bị ô nhiễm do xăng dầu
 - Ghi chú: Chưa có
 
-#### 4. Bài báo khoa học được chấp nhận tại Tạp chí Khoa học và Công nghệ Việt Nam
+#### 4. Bài báo khoa học
 - Loại sản phẩm: Dạng III
 - Số lượng: 01 bài báo
-- Mô tả chi tiết: Bài báo khoa học được chấp nhận tại Tạp chí Khoa học và Công nghệ Việt Nam.
-- Kết quả chính: Được chấp nhận
+- Mô tả chi tiết: Được chấp nhận
+- Kết quả chính: Bài báo khoa học
 - Ghi chú: Chưa có
 
 #### 5. Sáng chế: “Quy trình chế tạo tấm vi sinh vật để xử lý nước thải nhiễm dầu”
