@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-import re
+import math
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Optional
@@ -12,7 +12,7 @@ from pydantic import BaseModel
 from config import get_llm_config
 from llm_client import create_llm_client
 from schemas import SanPhamKHCN, ScientificReportSchema
-from vlm_parser import extract_pdf_page_range, parse_pdf_first_pages, parse_pdf_to_markdown
+from vlm_parser import parse_pdf_first_pages, parse_pdf_to_markdown
 
 logger = logging.getLogger(__name__)
 
@@ -21,10 +21,14 @@ PHASE1_PAGES = 4
 PHASE2_MIN_SECTION_LEN = 50
 PHASE2_MAX_TOKENS = 1200
 PHASE3_MAX_TOKENS = 700
-KHCN_FALLBACK_WINDOW = 12000
-KHCN_PAGE_WINDOW = 3
+SEMANTIC_QUERY = "Các kết quả nghiên cứu hoặc sản phẩm khoa học và công nghệ của đề tài này là gì?"
+SEMANTIC_TOP_K = 5
+MOCK_EMBED_DIM = 256
+PARAGRAPH_OVERLAP_CHARS = 120
 ProgressCallback = Callable[[int, str], None]
 EventCallback = Callable[[str, dict[str, Any]], None]
+
+_BGE_M3_MODEL = None
 
 
 class ProductCandidate(BaseModel):
@@ -162,7 +166,14 @@ def _call_llm_json(model: type[BaseModel], *, system_prompt: str, user_prompt: s
 def _canonical_text(value: str) -> str:
     decomposed = unicodedata.normalize("NFD", value.lower())
     no_accents = "".join(ch for ch in decomposed if unicodedata.category(ch) != "Mn")
-    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", no_accents)).strip()
+
+    normalized_chars: list[str] = []
+    for ch in no_accents:
+        if ch.isalnum() or ch.isspace():
+            normalized_chars.append(ch)
+        else:
+            normalized_chars.append(" ")
+    return " ".join("".join(normalized_chars).split())
 
 
 def _token_set(value: str) -> set[str]:
@@ -179,6 +190,134 @@ def _normalize_type_by_name(name: str, hint: str | None) -> str | None:
     if any(k in text for k in ["che pham", "tap hop", "chung vi sinh", "vat lieu", "thiet bi"]):
         return "Dạng I"
     return hint
+
+
+def chunk_text(text: str, chunk_size: int = 800, overlap: int = 100) -> list[str]:
+    """Chunk by paragraphs and preserve overlap for better semantic recall."""
+    if not text:
+        return []
+
+    safe_chunk_size = max(100, chunk_size)
+    safe_overlap = max(0, min(overlap, safe_chunk_size - 1))
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    if not paragraphs:
+        return []
+
+    chunks: list[str] = []
+    current = ""
+    for paragraph in paragraphs:
+        candidate = f"{current}\n\n{paragraph}".strip() if current else paragraph
+        if len(candidate) <= safe_chunk_size:
+            current = candidate
+            continue
+
+        if current:
+            chunks.append(current)
+            overlap_tail = current[-safe_overlap:] if safe_overlap else ""
+            current = f"{overlap_tail}\n\n{paragraph}".strip() if overlap_tail else paragraph
+        else:
+            chunks.append(paragraph[:safe_chunk_size])
+            current = paragraph[max(0, safe_chunk_size - safe_overlap):]
+
+    if current.strip():
+        chunks.append(current.strip())
+
+    return chunks
+
+
+def _mock_embed_texts(texts: list[str], dim: int = MOCK_EMBED_DIM) -> list[list[float]]:
+    """Deterministic lightweight embedding fallback so pipeline still runs without external model."""
+    vectors: list[list[float]] = []
+    for text in texts:
+        vec = [0.0] * dim
+        for token in _token_set(text):
+            idx = hash(token) % dim
+            vec[idx] += 1.0
+        vectors.append(vec)
+    return vectors
+
+
+def _get_bge_m3_model():
+    global _BGE_M3_MODEL
+    if _BGE_M3_MODEL is None:
+        from FlagEmbedding import BGEM3FlagModel
+
+        _BGE_M3_MODEL = BGEM3FlagModel("BAAI/bge-m3", use_fp16=False)
+    return _BGE_M3_MODEL
+
+
+def embed_texts(list_of_strings: list[str]) -> list[list[float]]:
+    """Embed texts with BGEM3; fall back to mock vectors if model is unavailable."""
+    if not list_of_strings:
+        return []
+
+    try:
+        model = _get_bge_m3_model()
+        encoded = model.encode(
+            list_of_strings,
+            return_dense=True,
+            return_sparse=False,
+            return_colbert_vecs=False,
+        )
+        dense_vectors = encoded.get("dense_vecs")
+        if dense_vectors is None:
+            raise RuntimeError("BGEM3 did not return dense_vecs")
+        return [list(map(float, row)) for row in dense_vectors]
+    except Exception as exc:
+        logger.warning("BGEM3 unavailable, using mock embeddings: %s", exc)
+        return _mock_embed_texts(list_of_strings)
+
+
+def cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
+    """Compute cosine similarity for two dense vectors."""
+    if not vec_a or not vec_b or len(vec_a) != len(vec_b):
+        return 0.0
+
+    dot = sum(a * b for a, b in zip(vec_a, vec_b))
+    norm_a = math.sqrt(sum(a * a for a in vec_a))
+    norm_b = math.sqrt(sum(b * b for b in vec_b))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def semantic_retrieve(chunks: list[str], query: str, top_k: int = 5) -> list[str]:
+    """Return top-k chunks most semantically similar to the query."""
+    if not chunks or not query.strip():
+        return []
+
+    embeddings = embed_texts(chunks + [query])
+    if not embeddings or len(embeddings) != len(chunks) + 1:
+        return []
+
+    query_vec = embeddings[-1]
+    ranked = []
+    for idx, chunk_vec in enumerate(embeddings[:-1]):
+        score = cosine_similarity(chunk_vec, query_vec)
+        ranked.append((score, idx))
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    selected_idx = [idx for _, idx in ranked[: max(1, top_k)]]
+    selected_idx.sort()
+    return [chunks[idx] for idx in selected_idx]
+
+
+def _phase2a_build_semantic_context(full_text: str) -> str:
+    """Build Phase 2 context via semantic retrieval instead of brittle heading regex.
+
+    Regex heading detection often fails because products can appear across many sections
+    (mô hình, giải pháp, đóng góp, kết quả), not only one fixed title.
+    """
+    chunks = chunk_text(full_text, chunk_size=800, overlap=PARAGRAPH_OVERLAP_CHARS)
+    if not chunks:
+        return ""
+
+    top_chunks = semantic_retrieve(chunks, SEMANTIC_QUERY, top_k=SEMANTIC_TOP_K)
+    if top_chunks:
+        return "\n\n".join(top_chunks).strip()
+
+    # Semantic fallback keeps pipeline running even when embedding backend is unavailable.
+    return "\n\n".join(chunks[:SEMANTIC_TOP_K]).strip()
 
 
 def _dedupe_candidates(items: list[ProductCandidate]) -> list[ProductCandidate]:
@@ -239,63 +378,6 @@ def _phase1_extract_metadata(pdf_path: str, num_pages: int = 4) -> tuple[str, st
         raise RuntimeError("LLM returned empty metadata.")
     logger.info("Phase 1 complete: %s / %s", data.ten_nhiem_vu[:50], data.chu_nhiem)
     return data.ten_nhiem_vu, data.chu_nhiem, data.to_chuc_chu_tri
-
-
-def _phase2a_find_khcn_section(full_text: str) -> str | None:
-    """Phase 2a: Use regex to locate KH&CN section with generic boundaries."""
-    # Chỉ regex theo từ khóa KH&CN/KHCN để áp dụng cho tài liệu tổng quát.
-    start_match = re.search(r"sản\s*phẩm\s*kh\s*&\s*cn|sản\s*phẩm\s*khcn", full_text, re.IGNORECASE)
-    if start_match:
-        start = max(0, start_match.start() - 200)
-        tail = full_text[start:]
-
-        # Cố gắng dừng ở tiêu đề mục lớn kế tiếp (nếu có), nếu không lấy window cố định.
-        stop_match = re.search(
-            r"\n\s*(?:IV\.|V\.|4\.|5\.|KẾT\s+LUẬN|KET\s+LUAN|TÀI\s+LIỆU\s+THAM\s+KHẢO|TAI\s+LIEU\s+THAM\s+KHAO)\b",
-            tail,
-            re.IGNORECASE,
-        )
-        if stop_match:
-            section = tail[: stop_match.start()]
-        else:
-            section = tail[:KHCN_FALLBACK_WINDOW]
-
-        logger.info("Phase 2a: Found KH&CN section with products (%d chars)", len(section))
-        return section
-    logger.warning("Phase 2a: KH&CN section not found")
-    return None
-
-
-def _phase2_extract_khcn_text(pdf_path: str) -> str | None:
-    """Extract only the relevant KH&CN page window to reduce phase 2 latency."""
-    page_window = _find_khcn_page_window(pdf_path)
-    if page_window is not None:
-        start_page, end_page = page_window
-        logger.info("Phase 2: Using page window %d-%d", start_page, end_page)
-        return extract_pdf_page_range(pdf_path, start_page, end_page)
-
-    logger.warning("Phase 2: KH&CN page window not found, falling back to full text extraction")
-    return parse_pdf_to_markdown(pdf_path)
-
-
-def _find_khcn_page_window(pdf_path: str) -> tuple[int, int] | None:
-    """Find a narrow page window around the KH&CN section by scanning page text."""
-    from pypdf import PdfReader
-
-    reader = PdfReader(pdf_path)
-    start_page = None
-    end_page = None
-
-    for idx, page in enumerate(reader.pages, start=1):
-        text = (page.extract_text() or "").lower()
-        if start_page is None and ("sản phẩm kh&cn" in text or "sản phẩm khcn" in text):
-            start_page = idx
-            end_page = min(len(reader.pages), idx + KHCN_PAGE_WINDOW - 1)
-            break
-
-    if start_page is None:
-        return None
-    return start_page, end_page
 
 
 def _phase2b_extract_products(khcn_section: str) -> list[ProductCandidate]:
@@ -407,11 +489,14 @@ def extract_information_v2(
     _notify(progress_callback, 25, "Phase 1 hoàn tất")
 
     _notify(progress_callback, 32, "Phase 2: Đọc nội dung tài liệu...")
-    full_text = _phase2_extract_khcn_text(pdf_path)
-    _notify(progress_callback, 42, "Phase 2a: Tìm section KH&CN...")
-    khcn_section = _phase2a_find_khcn_section(full_text) if full_text else None
+    # Giữ đúng yêu cầu: chỉ OCR/đọc trang đầu cho metadata (Phase 1),
+    # còn sản phẩm KH&CN thì extract full text (không OCR full) + semantic retrieval.
+    full_text = parse_pdf_to_markdown(pdf_path)
+    _notify(progress_callback, 42, "Phase 2a: Semantic retrieve nội dung sản phẩm KH&CN...")
+    khcn_section = _phase2a_build_semantic_context(full_text)
+
     _notify(progress_callback, 52, "Phase 2b: Nhận diện danh sách sản phẩm...")
-    products = _phase2b_extract_products(khcn_section or "") if khcn_section else []
+    products = _phase2b_extract_products(khcn_section)
     _notify(progress_callback, 62, f"Đã nhận diện {len(products)} sản phẩm")
     _emit(
         event_callback,
